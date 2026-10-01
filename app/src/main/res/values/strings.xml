@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Zcar Click</string>
+    <string name="service_label">Zcar Click</string>
+    <string name="tile_label">Zcar Click</string>
+    <string name="service_desc">Hiển thị nút nổi. Khi bấm trong cuộc trò chuyện Zalo, ứng dụng sẽ nhấn giữ tin nhắn gần nhất, chọn "Trả lời" và điền nội dung mẫu bạn đã cài. Ứng dụng chỉ đọc màn hình khi bạn bấm nút, không lưu hay gửi dữ liệu ra ngoài.</string>
+</resources>
