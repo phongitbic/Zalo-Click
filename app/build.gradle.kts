@@ -15,8 +15,8 @@ android {
         applicationId = "vn.quickquote.zalo"
         minSdk = 24
         targetSdk = 34
-        versionCode = 11
-        versionName = "2.7.2"
+        versionCode = 12
+        versionName = "2.8.0"
     }
 
     // Keystore cố định: các bản build sau cài đè được lên bản trước, không phải gỡ app

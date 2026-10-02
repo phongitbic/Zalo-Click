@@ -34,6 +34,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean(K_DEBUG, false)
         set(v) = sp.edit().putBoolean(K_DEBUG, v).apply()
 
+    /** Thời gian vuốt để trả lời (ms). Tự học: nếu vuốt nhanh không ăn, app tự chuyển về mức an toàn. */
+    var swipeMs: Long
+        get() = sp.getLong(K_SWIPE_MS, SWIPE_FAST_MS)
+        set(v) = sp.edit().putLong(K_SWIPE_MS, v).apply()
+
     var posX: Int
         get() = sp.getInt(K_POS_X, -1)
         set(v) = sp.edit().putInt(K_POS_X, v).apply()
@@ -76,6 +81,9 @@ class Prefs(context: Context) {
         const val K_POS_Y = "pos_y"
         const val K_ACTIVE = "active_index"
         const val K_TEMPLATES = "templates"
+        const val K_SWIPE_MS = "swipe_ms"
+        const val SWIPE_FAST_MS = 55L
+        const val SWIPE_SAFE_MS = 110L
         const val DEFAULT_TEMPLATE = "Dạ em đã nhận được thông tin, em kiểm tra và phản hồi anh/chị ngay ạ."
     }
 }

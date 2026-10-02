@@ -56,6 +56,15 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
             RegexOption.IGNORE_CASE
         )
         private const val BUSY_TIMEOUT_MS = 10_000L
+
+        /**
+         * true khi dịch vụ Trợ năng THỰC SỰ đang chạy.
+         * Cài đặt Trợ năng có thể vẫn hiện "Bật" dù hệ thống (tối ưu pin, dọn RAM, cập nhật app)
+         * đã dừng dịch vụ -> bật/tắt nút nổi lúc đó không có tác dụng. App dùng cờ này để báo đúng.
+         */
+        @Volatile
+        var running = false
+            private set
     }
 
     private lateinit var prefs: Prefs
@@ -81,6 +90,12 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
 
     private var operationStartedAt = 0L
 
+    /**
+     * Khung danh sách tin nhắn, ghi nhớ trong suốt 1 lần bấm để khỏi quét lại toàn bộ màn hình
+     * ở mỗi lần kiểm tra thanh trả lời (trước đây mỗi lần kiểm tra = 2 lượt quét toàn bộ cây).
+     */
+    private var opChatList: AccessibilityNodeInfo? = null
+
     // ================================================================ lifecycle
 
     override fun onServiceConnected() {
@@ -88,8 +103,10 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
         prefs = Prefs(this)
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
         prefs.sp.registerOnSharedPreferenceChangeListener(this)
+        running = true
         currentPkg = foregroundPkg()
-        refreshBubble()
+        safeRefreshBubble()
+        handler.removeCallbacks(watchdog)
         handler.postDelayed(watchdog, 1500)
     }
 
@@ -104,6 +121,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     }
 
     private fun cleanup() {
+        running = false
         if (::prefs.isInitialized) prefs.sp.unregisterOnSharedPreferenceChangeListener(this)
         removeBubble()
         removeBanner()
@@ -169,22 +187,44 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
 
     private val pkgCheck = Runnable {
         if (busy) return@Runnable
-        val pkg = foregroundPkg()
-        if (pkg != null && !isOverlayPkg(pkg)) currentPkg = pkg
-        refreshBubble()
+        try {
+            val pkg = foregroundPkg()
+            if (pkg != null && !isOverlayPkg(pkg)) currentPkg = pkg
+        } catch (_: Exception) {}
+        safeRefreshBubble()
     }
 
     /** Kiểm tra định kỳ (1,5 s) để nút nổi luôn đúng trạng thái kể cả khi hệ thống bỏ lỡ sự kiện. */
     private val watchdog = object : Runnable {
         override fun run() {
-            if (::prefs.isInitialized && prefs.enabled && !busy) pkgCheck.run()
+            try {
+                if (::prefs.isInitialized && prefs.enabled && !busy) pkgCheck.run()
+            } catch (_: Exception) {}
             handler.postDelayed(this, 1500)
         }
     }
 
     override fun onSharedPreferenceChanged(sp: SharedPreferences?, key: String?) {
         when (key) {
-            Prefs.K_ENABLED, Prefs.K_ONLY_ZALO, Prefs.K_SIZE -> handler.post { refreshBubble() }
+            Prefs.K_ENABLED, Prefs.K_ONLY_ZALO, Prefs.K_SIZE -> handler.post {
+                // Bật lại từ app/ô Cài đặt nhanh: cập nhật ngay ứng dụng đang mở để nút hiện tức thì.
+                if (key == Prefs.K_ENABLED && ::prefs.isInitialized && prefs.enabled) {
+                    try { foregroundPkg()?.let { if (!isOverlayPkg(it)) currentPkg = it } } catch (_: Exception) {}
+                }
+                safeRefreshBubble()
+            }
+        }
+    }
+
+    /**
+     * Mọi lỗi bất ngờ khi vẽ nút nổi đều bị chặn tại đây. Một exception lọt ra ngoài sẽ làm
+     * hệ thống dừng dịch vụ Trợ năng -> nút nổi biến mất và bật/tắt không còn tác dụng.
+     */
+    private fun safeRefreshBubble() {
+        try {
+            refreshBubble()
+        } catch (e: Exception) {
+            try { removeBubble() } catch (_: Exception) {}
         }
     }
 
@@ -220,8 +260,10 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = if (prefs.posX < 0) screenW() - size - dp(6) else prefs.posX.coerceIn(0, screenW() - size)
-            y = prefs.posY.coerceIn(dp(24), screenH() - size - dp(24))
+            x = if (prefs.posX < 0) screenW() - size - dp(6)
+                else prefs.posX.coerceIn(0, maxOf(0, screenW() - size))
+            // maxOf: tránh lỗi khoảng rỗng (IllegalArgumentException) khi màn hình xoay ngang/thu nhỏ.
+            y = prefs.posY.coerceIn(dp(24), maxOf(dp(24), screenH() - size - dp(24)))
         }
         v.setOnTouchListener(BubbleTouch(p))
         try {
@@ -269,7 +311,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     private fun snapToEdge(v: View, p: WindowManager.LayoutParams) {
         val size = p.width
         val targetX = if (p.x + size / 2 < screenW() / 2) dp(6) else screenW() - size - dp(6)
-        p.y = p.y.coerceIn(dp(24), screenH() - size - dp(24))
+        p.y = p.y.coerceIn(dp(24), maxOf(dp(24), screenH() - size - dp(24)))
         ValueAnimator.ofInt(p.x, targetX).apply {
             duration = 220
             interpolator = DecelerateInterpolator()
@@ -310,8 +352,11 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
                     v.animate().scaleX(0.88f).scaleY(0.88f).setDuration(90).start()
                     handler.postDelayed(longPressRunnable, 550)
                     // Tận dụng thời gian ngón tay còn đang ấn để tìm sẵn tin nhắn.
+                    if (!busy) opChatList = null // không dùng lại khung của cuộc trò chuyện trước
                     handler.post {
-                        if (!moved && !longFired && !busy) preparedTap = prepareTap()
+                        if (!moved && !longFired && !busy) {
+                            preparedTap = try { prepareTap() } catch (_: Exception) { null }
+                        }
                     }
                 }
                 MotionEvent.ACTION_MOVE -> {
@@ -335,7 +380,12 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
                         snapToEdge(v, p)
                     } else if (!longFired) {
                         v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
-                        onBubbleTap(preparedTap)
+                        try {
+                            onBubbleTap(preparedTap)
+                        } catch (ex: Exception) {
+                            // Lỗi đọc màn hình không được phép làm sập dịch vụ (sẽ mất nút nổi).
+                            if (busy) fail("Lỗi: ${ex.javaClass.simpleName}") else toast("Lỗi: ${ex.javaClass.simpleName}")
+                        }
                     }
                     preparedTap = null
                 }
@@ -373,8 +423,11 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     private fun done() {
         handler.removeCallbacks(busyTimeout)
         busy = false
+        opChatList = null
+        bubble?.alpha = 1f // phòng trường hợp ảnh chụp màn hình không trả về -> nút bị ẩn mãi
         setBubbleTouchable(true)
-        Diag.save(this)
+        // Ghi báo cáo sau khi đã trả nút về trạng thái sẵn sàng, không chặn thao tác kế tiếp.
+        handler.post { Diag.save(this) }
     }
 
     private fun fail(msg: String) {
@@ -466,8 +519,41 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
 
     private fun startQuote(target: Target, text: String, before: Snapshot) {
         Diag.line("Tin nhắn chọn: ${target.info} | thao tác tại (${target.x.toInt()},${target.y.toInt()})")
-        // Vuốt để trả lời nhanh hơn nhấn giữ -> đợi menu -> bấm Trả lời.
-        trySwipe(target, text, before)
+        // Nhanh nhất: nếu Zalo gắn sẵn hành động "Trả lời" cho tin nhắn thì gọi thẳng,
+        // không cần cử chỉ vuốt/nhấn giữ (không phải chờ ngón tay ảo di chuyển).
+        val act = try { findReplyAction(target.node) } catch (_: Exception) { null }
+        if (act != null && act.first.performAction(act.second.id)) {
+            step("Gọi hành động Trả lời có sẵn")
+            waitForReply(before, target.label, tries = 25, interval = 8L) { input ->
+                if (input != null) {
+                    step("Đã vào chế độ trả lời")
+                    fillInto(input, text, before, target.label)
+                } else {
+                    trySwipe(target, text, before, prefs.swipeMs)
+                }
+            }
+            return
+        }
+        trySwipe(target, text, before, prefs.swipeMs)
+    }
+
+    /** Hành động "Trả lời" mà Zalo có thể cung cấp sẵn trên tin nhắn (hoặc khung cha gần nhất). */
+    private fun findReplyAction(
+        node: AccessibilityNodeInfo
+    ): Pair<AccessibilityNodeInfo, AccessibilityNodeInfo.AccessibilityAction>? {
+        var n: AccessibilityNodeInfo? = node
+        var level = 0
+        while (n != null && level++ < 4) {
+            val acts = n.actionList ?: emptyList()
+            val custom = acts.filter { it.label != null }
+            if (custom.isNotEmpty() && level == 1) {
+                Diag.line("Hành động có sẵn: " + custom.joinToString { it.label.toString() })
+            }
+            custom.firstOrNull { a -> norm(a.label)?.let { l -> REPLY_WORDS.any { l == it } } == true }
+                ?.let { return n!! to it }
+            n = n.parent
+        }
+        return null
     }
 
     /** Còn đang ở trong cuộc trò chuyện Zalo (có ô nhập tin) hay không. */
@@ -485,30 +571,43 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
         return null
     }
 
-    /** Đường nhanh: vuốt trái trực tiếp trên tin nhắn để mở thanh trả lời. */
-    private fun trySwipe(target: Target, text: String, before: Snapshot) {
+    /**
+     * Vuốt trái trên tin nhắn để mở thanh trả lời.
+     * Mặc định vuốt nhanh (prefs.swipeMs). Nếu Zalo không nhận cú vuốt nhanh thì vuốt lại
+     * chậm hơn 1 lần và GHI NHỚ tốc độ vuốt nào chạy được cho những lần sau.
+     */
+    private fun trySwipe(target: Target, text: String, before: Snapshot, durationMs: Long, retried: Boolean = false) {
         if (!busy) return
-        step("Vuốt để trả lời")
+        step("Vuốt để trả lời (${durationMs}ms)")
         val tb = target.rect
         val y = tb.exactCenterY()
         val x1 = maxOf(tb.exactCenterX(), screenW() * 0.55f)
         val x2 = maxOf(x1 - dp(150), screenW() * 0.15f)
-        swipe(x1, y, x2, y) { ok ->
+        swipe(x1, y, x2, y, durationMs) { ok ->
             if (!busy) return@swipe
             if (!ok) {
                 tryLongPress(target, text)
                 return@swipe
             }
-            waitForReply(before, target.label, tries = 14, interval = 15L) { input ->
+            // Kiểm tra mỗi 8 ms (mỗi lần kiểm tra giờ rất nhẹ) trong tối đa ~220 ms.
+            waitForReply(before, target.label, tries = 27, interval = 8L) { input ->
                 if (input != null) {
                     step("Đã vào chế độ trả lời")
-                    fillInto(input, text)
+                    if (prefs.swipeMs != durationMs) prefs.swipeMs = durationMs
+                    fillInto(input, text, before, target.label)
                 } else {
-                    Diag.line("Vuốt chưa mở được thanh trả lời, chuyển sang nhấn giữ")
-                    handler.postDelayed({
-                        val lateInput = replyInput(before, target.label)
-                        if (lateInput != null) fillInto(lateInput, text) else tryLongPress(target, text)
-                    }, 30)
+                    val lateInput = try { replyInput(before, target.label) } catch (_: Exception) { null }
+                    when {
+                        lateInput != null -> fillInto(lateInput, text, before, target.label)
+                        !retried && durationMs < Prefs.SWIPE_SAFE_MS -> {
+                            Diag.line("Vuốt nhanh chưa ăn, vuốt lại chậm hơn")
+                            trySwipe(target, text, before, Prefs.SWIPE_SAFE_MS, retried = true)
+                        }
+                        else -> {
+                            Diag.line("Vuốt chưa mở được thanh trả lời, chuyển sang nhấn giữ")
+                            tryLongPress(target, text)
+                        }
+                    }
                 }
             }
         }
@@ -529,7 +628,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
                 fail("Thao tác nhấn giữ bị huỷ")
                 return@openMessageMenu
             }
-            waitForNode(tries = 30, interval = 20L, finder = { findReplyButton() }) { btn ->
+            waitForNode(tries = 60, interval = 10L, finder = { findReplyButton() }) { btn ->
                 if (btn == null) {
                     if (contextMenuOpen()) performGlobalAction(GLOBAL_ACTION_BACK)
                     Diag.dump("SAU KHI NHẤN GIỮ (không thấy nút Trả lời)", allRoots())
@@ -539,9 +638,9 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
                 step("Chọn \"Trả lời\"")
                 Diag.line("Nút trả lời: ${Diag.describe(btn)}")
                 clickNode(btn)
-                waitForReply(before, target.label, tries = 30, interval = 20L) { input ->
+                waitForReply(before, target.label, tries = 60, interval = 10L) { input ->
                     if (input != null) {
-                        fillInto(input, text)
+                        fillInto(input, text, before, target.label)
                     } else {
                         Diag.line(replyDebug(before, target.label))
                         fail("Chưa xác nhận được quote, dừng điền và gửi")
@@ -594,25 +693,28 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     private fun replyBarLabels(root: AccessibilityNodeInfo, input: AccessibilityNodeInfo): Set<String> {
         val inputTop = bounds(input).top
         // Không xác định được danh sách tin thì chưa đủ bằng chứng để tự gửi.
-        val chatList = findChatList(root, inputTop) ?: return emptySet()
+        val chatList = cachedChatList(root, inputTop) ?: return emptySet()
+        val bandTop = inputTop - dp(140)
         val candidates = ArrayList<ReplyCandidate>()
-        fun walk(n: AccessibilityNodeInfo, depth: Int, insideMessages: Boolean) {
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
             if (depth > 60) return
-            val inList = insideMessages || n == chatList
-            if (n.isVisibleToUser && !n.isEditable) {
-                val b = bounds(n)
-                // Chỉ đọc vùng mà thanh trả lời có thể xuất hiện.
-                if (b.bottom > inputTop - dp(140) && b.top < inputTop) {
-                    label(n)?.let { candidates.add(ReplyCandidate(it, b.top, b.bottom, inList)) }
-                    val id = n.viewIdResourceName?.substringAfter(":id/")?.lowercase()
-                    if (id != null && (id.contains("reply") || id.contains("quote"))) {
-                        candidates.add(ReplyCandidate("trả lời [id=$id]", b.top, b.bottom, inList))
-                    }
+            // Mọi nhãn bên trong danh sách tin nhắn đều bị loại ở ReplyDetection.barLabels
+            // -> bỏ qua cả nhánh này (nhánh lớn nhất màn hình) thay vì đọc từng tin.
+            if (n == chatList) return
+            val b = bounds(n)
+            val inBand = b.bottom > bandTop && b.top < inputTop
+            // Khung con luôn nằm trong khung cha: nhánh nằm ngoài vùng thanh trả lời thì bỏ qua.
+            if (depth > 0 && !b.isEmpty && !inBand) return
+            if (inBand && n.isVisibleToUser && !n.isEditable) {
+                label(n)?.let { candidates.add(ReplyCandidate(it, b.top, b.bottom, false)) }
+                val id = n.viewIdResourceName?.substringAfter(":id/")?.lowercase()
+                if (id != null && (id.contains("reply") || id.contains("quote"))) {
+                    candidates.add(ReplyCandidate("trả lời [id=$id]", b.top, b.bottom, false))
                 }
             }
-            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1, inList) }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
         }
-        walk(root, 0, false)
+        walk(root, 0)
         return ReplyDetection.barLabels(candidates, inputTop, dp(140))
     }
 
@@ -624,7 +726,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
         cb: (AccessibilityNodeInfo?) -> Unit
     ) {
         if (!busy) return
-        val input = replyInput(before, targetLabel)
+        val input = try { replyInput(before, targetLabel) } catch (_: Exception) { null }
         if (input != null || tries <= 0) {
             cb(input)
             return
@@ -635,7 +737,20 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
         )
     }
 
-    private fun fillInto(input: AccessibilityNodeInfo, text: String) {
+    private fun fillInto(input: AccessibilityNodeInfo, text: String, before: Snapshot, targetLabel: String?) {
+        try {
+            fillIntoUnsafe(input, text, before, targetLabel)
+        } catch (e: Exception) {
+            fail("Lỗi khi điền/gửi: ${e.javaClass.simpleName}")
+        }
+    }
+
+    private fun fillIntoUnsafe(
+        input: AccessibilityNodeInfo,
+        text: String,
+        before: Snapshot,
+        targetLabel: String?
+    ) {
         step("Điền nội dung")
         // Giữ lại hàng ô nhập: Zalo 26.09.01 có thể dựng lại compose panel
         // sau ACTION_SET_TEXT và không đưa nút Gửi vào cây trợ năng.
@@ -660,9 +775,25 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
             toast("✓ Đã quote, kiểm tra rồi bấm Gửi")
             return
         }
+        // BẮT BUỘC có quote: kiểm tra lại khung trả lời NGAY TRƯỚC khi bấm Gửi
+        // (phòng trường hợp Zalo dựng lại ô nhập sau khi điền chữ và làm mất khung quote).
+        // Không xác nhận được -> giữ nguyên nội dung đã điền, KHÔNG gửi.
+        waitForReply(before, targetLabel, tries = 16, interval = 10L) { still ->
+            if (still == null) {
+                Diag.line("Mất khung quote sau khi điền -> KHÔNG gửi")
+                Diag.line(replyDebug(before, targetLabel))
+                done()
+                toast("Chưa thấy khung quote nên KHÔNG tự gửi.\nKiểm tra lại rồi bấm Gửi bằng tay.")
+                return@waitForReply
+            }
+            pressSend(input, inputBounds)
+        }
+    }
+
+    private fun pressSend(input: AccessibilityNodeInfo, inputBounds: Rect) {
         // Thử node Gửi trong 45 ms. Nếu Zalo ẩn node, chạm thẳng nút ngoài cùng
         // bên phải trên chính hàng ô nhập đã xác nhận.
-        waitForNode(tries = 3, interval = 15L, finder = {
+        waitForNode(tries = 5, interval = 8L, finder = {
             val freshInput = safeRoot()?.let { findInput(it) } ?: input
             findSendButton(freshInput, strict = true)
         }) { send ->
@@ -685,7 +816,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     private fun sendDone() {
         Diag.line("THÀNH CÔNG")
         done()
-        toast("✓ Đã quote và gửi")
+        // Không hiện thông báo "Đã quote và gửi" nữa: tin đã hiện trong Zalo là đủ xác nhận.
     }
 
     private fun pasteViaClipboard(input: AccessibilityNodeInfo, text: String): Boolean = try {
@@ -761,10 +892,38 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
             .maxByOrNull { bounds(it).bottom }
     }
 
-    private fun findChatList(root: AccessibilityNodeInfo, inputTop: Int): AccessibilityNodeInfo? =
-        collect(root) { it.isScrollable && it.isVisibleToUser }
-            .filter { val b = bounds(it); b.top < inputTop && b.height() > dp(150) }
-            .maxByOrNull { val b = bounds(it); b.width().toLong() * b.height() }
+    /**
+     * Danh sách tin nhắn = khung cuộn lớn nhất phía trên ô nhập.
+     * Không đi sâu vào bên trong một khung cuộn đã đạt điều kiện (khung con luôn nhỏ hơn),
+     * nên không phải đọc từng tin nhắn chỉ để tìm khung danh sách.
+     */
+    private fun findChatList(root: AccessibilityNodeInfo, inputTop: Int): AccessibilityNodeInfo? {
+        var best: AccessibilityNodeInfo? = null
+        var bestArea = -1L
+        fun walk(n: AccessibilityNodeInfo, depth: Int) {
+            if (depth > 60) return
+            if (n.isScrollable && n.isVisibleToUser) {
+                val b = bounds(n)
+                if (b.top < inputTop && b.height() > dp(150)) {
+                    val area = b.width().toLong() * b.height()
+                    if (area > bestArea) { best = n; bestArea = area }
+                    return
+                }
+            }
+            for (i in 0 until n.childCount) n.getChild(i)?.let { walk(it, depth + 1) }
+        }
+        walk(root, 0)
+        return best
+    }
+
+    /** Dùng lại khung danh sách đã tìm trong lần bấm hiện tại nếu nó vẫn còn trên màn hình. */
+    private fun cachedChatList(root: AccessibilityNodeInfo, inputTop: Int): AccessibilityNodeInfo? {
+        opChatList?.let { c ->
+            val alive = try { c.refresh() && c.isVisibleToUser } catch (_: Exception) { false }
+            if (alive && c.windowId == root.windowId) return c
+        }
+        return findChatList(root, inputTop).also { opChatList = it }
+    }
 
     private enum class Side { LEFT, RIGHT, UNKNOWN }
 
@@ -776,7 +935,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
      */
     private fun pickTarget(root: AccessibilityNodeInfo, inputTop: Int, bmp: Bitmap?): Target? {
         val headerBottom = dp(96)
-        val scope = findChatList(root, inputTop) ?: root
+        val scope = cachedChatList(root, inputTop) ?: root
         val sb = bounds(scope)
         val areaLeft = if (sb.width() > 0) sb.left else 0
         val areaRight = if (sb.width() > 0) sb.right else screenW()
@@ -979,7 +1138,7 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
         cb: (AccessibilityNodeInfo?) -> Unit
     ) {
         if (!busy) return
-        val n = finder()
+        val n = try { finder() } catch (_: Exception) { null }
         if (n != null || tries <= 0) {
             cb(n)
             return
@@ -1045,8 +1204,8 @@ class ZaloQuoteService : AccessibilityService(), SharedPreferences.OnSharedPrefe
     private fun longPressMs(): Long =
         (ViewConfiguration.getLongPressTimeout() + 60).toLong().coerceIn(350L, 700L)
 
-    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, cb: (Boolean) -> Unit) =
-        runGesture(gesture(x1, y1, x2, y2, 100), cb)
+    private fun swipe(x1: Float, y1: Float, x2: Float, y2: Float, durationMs: Long, cb: (Boolean) -> Unit) =
+        runGesture(gesture(x1, y1, x2, y2, durationMs), cb)
 
     // ================================================================ banner thông báo
 

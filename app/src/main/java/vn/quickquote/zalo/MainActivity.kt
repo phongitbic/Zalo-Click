@@ -13,6 +13,10 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.net.Uri
 import android.provider.Settings
 import android.text.Editable
 import android.text.InputType
@@ -84,6 +88,8 @@ class MainActivity : Activity() {
 
     private lateinit var statusChip: TextView
     private lateinit var permissionBtn: TextView
+    private lateinit var batteryBtn: TextView
+    private val uiHandler = Handler(Looper.getMainLooper())
     private lateinit var activePreview: TextView
     private lateinit var templateBox: LinearLayout
     private lateinit var templateHeading: TextView
@@ -155,6 +161,14 @@ class MainActivity : Activity() {
         super.onResume()
         refreshStatus()
         refreshReportInfo()
+        // Khi mở app lúc tiến trình vừa bị dọn, hệ thống cần một nhịp để nối lại dịch vụ Trợ năng.
+        uiHandler.removeCallbacksAndMessages(null)
+        uiHandler.postDelayed({ refreshStatus() }, 1200)
+    }
+
+    override fun onPause() {
+        uiHandler.removeCallbacksAndMessages(null)
+        super.onPause()
     }
 
     private fun setupSystemBars() {
@@ -247,16 +261,32 @@ class MainActivity : Activity() {
         }
         inner.addView(permissionBtn)
 
+        batteryBtn = button("Cho phép chạy nền (tránh nút nổi tự mất)", style = BtnStyle.ON_DARK) {
+            openBatterySettings()
+        }.apply {
+            layoutParams = LinearLayout.LayoutParams(MATCH, WRAP).apply { topMargin = dp(8) }
+        }
+        inner.addView(batteryBtn)
+
         hero.addView(inner)
         refreshActivePreview()
         return hero
     }
 
     private fun refreshStatus() {
-        val service = isServiceEnabled()
-        permissionBtn.visibility = if (service) View.GONE else View.VISIBLE
+        val inSettings = isServiceEnabled()
+        // Cài đặt có thể vẫn ghi "Bật" trong khi hệ thống đã dừng dịch vụ (dọn RAM, tối ưu pin,
+        // cài đè bản mới). Lúc đó bật/tắt nút nổi không có tác dụng -> phải báo rõ cho người dùng.
+        val running = ZaloQuoteService.running
+        permissionBtn.visibility = if (inSettings && running) View.GONE else View.VISIBLE
+        permissionBtn.text = if (inSettings && !running)
+            "Trợ năng bị dừng – bấm để TẮT rồi BẬT lại Zcar Click"
+        else
+            "Bật quyền Trợ năng để bắt đầu"
+        batteryBtn.visibility = if (ignoringBatteryOpt()) View.GONE else View.VISIBLE
         val (color, label) = when {
-            !service -> DOT_OFF to "Chưa bật quyền Trợ năng"
+            !inSettings -> DOT_OFF to "Chưa bật quyền Trợ năng"
+            !running -> DOT_OFF to "Dịch vụ bị hệ thống dừng – nút nổi sẽ không hiện"
             !prefs.enabled -> DOT_WARN to "Nút nổi đang tắt"
             else -> DOT_OK to "Sẵn sàng hoạt động"
         }
@@ -276,6 +306,13 @@ class MainActivity : Activity() {
         c.body.addView(switchRow("Hiện nút nổi", "Bật/tắt nhanh ở ô Cài đặt nhanh trên thanh thông báo", prefs.enabled) {
             prefs.enabled = it
             refreshStatus()
+            if (it && !ZaloQuoteService.running) {
+                Toast.makeText(
+                    this,
+                    "Dịch vụ Trợ năng đang bị dừng nên nút nổi chưa hiện. Hãy tắt rồi bật lại Zcar Click trong Trợ năng.",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
         })
         c.body.addView(divider())
         c.body.addView(switchRow("Chỉ hiện khi mở Zalo", "Tự ẩn khi bạn chuyển sang ứng dụng khác", prefs.onlyInZalo) {
@@ -679,6 +716,27 @@ class MainActivity : Activity() {
     }
 
     // ================================================================ helpers
+
+    private fun ignoringBatteryOpt(): Boolean = try {
+        (getSystemService(POWER_SERVICE) as PowerManager).isIgnoringBatteryOptimizations(packageName)
+    } catch (_: Exception) {
+        true
+    }
+
+    /** Xin bỏ tối ưu pin để hệ thống không dừng dịch vụ Trợ năng khi màn hình tắt lâu / qua đêm. */
+    private fun openBatterySettings() {
+        try {
+            startActivity(
+                Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName"))
+            )
+        } catch (_: Exception) {
+            try {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            } catch (_: Exception) {
+                Toast.makeText(this, "Không mở được cài đặt pin trên máy này", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
 
     private fun isServiceEnabled(): Boolean {
         val s = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
